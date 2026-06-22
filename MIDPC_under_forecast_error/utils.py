@@ -264,13 +264,13 @@ def plot_chiller_data(data, save_path=None, Ts=init.Ts, time_unit=None):
     ### This counts all time steps when total cooling delivered is less than the load at that time step
     n_violations = 0; tolerance = 5 # [kW]
     for i in range(s_length):
-        if not data['Q_delivered'][0,i,:].sum(dim=-1, keepdim=True) + tolerance >= data['load'][0,i,0]:
+        if not data['Q_delivered'][0,i,:].sum(dim=-1, keepdim=True) + tolerance >= data['realized_load'][0,i,0]:
             n_violations += 1
     cost = torch.sum(data['P_pump'].sum(dim=-1,keepdim=True) + data['P_chiller'].sum(dim=-1, keepdim=True) + \
                      0. *  data['chiller_status'].sum(-1,keepdim=True)) *(Ts/3600)
     
     ### This checks the RMSE between the delivered cooling and the load
-    control_RMSE = torch.sqrt(torch.mean((data['load'][:,:s_length,:] - data['Q_delivered'].sum(dim=-1, keepdim=True))**2))
+    control_RMSE = torch.sqrt(torch.mean((data['realized_load'][:,:s_length,:] - data['Q_delivered'].sum(dim=-1, keepdim=True))**2))
 
 
     axes[1].set_title(f'Total cost of operation:  {cost.item():.1f} [kWh] \n  \
