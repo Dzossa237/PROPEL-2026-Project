@@ -85,6 +85,7 @@ def simulate(
         T_supply=output['T_supply'][:,:-1,:]
     )
     output['load'] = load_signal[:,:s_length,:]
+    output['realized_load'] = modified_load_set[:,:s_length,:] ### Add realized load to output
     return output
 
 if __name__=='__main__':
