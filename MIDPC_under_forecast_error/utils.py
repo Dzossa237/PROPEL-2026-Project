@@ -95,83 +95,127 @@ class customMPL(nn.Module):
             out = torch.clip(out, self.u_min, self.u_max)
         return out
 
-# GENERATE LOAD SIGNAL FUNCTION
-def generate_datacenter_load(
-sampling_time=300,   # seconds
-number_of_days=1,   #  Number of days 
-ramp_hours=4,       # transition duration [h]
-night_baseline=350, # kW
-osc_night_amp=250,  # nighttime oscillation amplitude [kW]
-day_baseline=1450,  # kW
-osc_day_amp=100,    # daytime oscillation amplitude [kW]
-noise_scale=00,     # base random noise [kW]
-ramp_jitter=00,     # extra noise during transitions [kW]
-f_day=2,            # frequency day
-f_night=4,          # frequency night
-daily_variation=0.1, # relative variation per day
-signal_seed=303,
+def generate_realized_load(
+    sampling_time=180,
+    nsteps=15,
+    num_scenarios=40000,
+    number_of_days=1,
+    ramp_hours=4,
+    night_baseline=350,
+    osc_night_amp=250,
+    day_baseline=1450,
+    osc_day_amp=100,
+    noise_scale=5,
+    ramp_jitter=5,
+    f_day=5,
+    f_night=6,
+    daily_variation=0.1,
+    signal_start_seed=303,
+    training=True,
 ):
+  
     def smooth_transition(x, start, end):
-        """Smooth 0→1 cosine ramp between start and end hours"""
         phase = torch.clamp((x - start) / (end - start), 0, 1)
         return 0.5 * (1 - torch.cos(torch.pi * phase))
 
-    torch.manual_seed(signal_seed)
-    # total samples for N days
-    total_seconds = (24 * 3600) * number_of_days
-    n_samples = int(total_seconds // sampling_time)
-    t = torch.arange(n_samples) * sampling_time / 3600  # time in hours
-    load = torch.zeros(n_samples)
+    realized_load_list = []
 
-    for d in range(number_of_days):
-        day_offset = slice(d * n_samples // number_of_days,
-                           (d+1) * n_samples // number_of_days)
-        td = t[day_offset]  # hours for this day
+    for i in range(num_scenarios):
+        torch.manual_seed(signal_start_seed + i)
 
-        # stochastic day baselines & oscillations
-        db_var = day_baseline() if callable(day_baseline) else day_baseline
-        db = db_var * (1 + daily_variation * torch.rand(1).uniform_(-1,1).item())
-        nb_var = night_baseline() if callable(night_baseline) else night_baseline
-        nb = nb_var * (1 + daily_variation * torch.rand(1).uniform_(-1,1).item())
-        oda = osc_day_amp * (1 + daily_variation * torch.rand(1).uniform_(-1,1).item())
-        ona = osc_night_amp * (1 + daily_variation * torch.rand(1).uniform_(-1,1).item())
+        total_seconds = (24 * 3600) * number_of_days
+        n_samples = int(total_seconds // sampling_time)
+        t = torch.arange(n_samples) * sampling_time / 3600
+        load = torch.zeros(n_samples)
 
-        # day/night factor
-        day_factor = smooth_transition(td % 24, 12 - ramp_hours, 12) \
-                   * (1 - smooth_transition(td % 24, 20, 20 + ramp_hours))
-        baseline = nb + (db - nb) * day_factor
+        for d in range(number_of_days):
+            day_offset = slice(d * n_samples // number_of_days,
+                               (d + 1) * n_samples // number_of_days)
+            td = t[day_offset]
 
-        # daily sinusoidal drift with random phase
-        drift_phase = 2 * torch.pi * torch.rand(1).item()
-        trend = 0.05 * baseline * torch.sin(2 * torch.pi * td / 24 + drift_phase)
+            db_var = day_baseline() if callable(day_baseline) else day_baseline
+            db = db_var * (1 + daily_variation * (torch.rand(1).item() * 2 - 1))
+            nb_var = night_baseline() if callable(night_baseline) else night_baseline
+            nb = nb_var * (1 + daily_variation * (torch.rand(1).item() * 2 - 1))
+            oda = osc_day_amp * (1 + daily_variation * (torch.rand(1).item() * 2 - 1))
+            ona = osc_night_amp * (1 + daily_variation * (torch.rand(1).item() * 2 - 1))
 
-        # oscillations with randomized frequencies
-        freq_day = (f_day + torch.randn(1).item() * 0.5) / 24
-        freq_night = (f_night + torch.randn(1).item() * 0.5) / 24
-        osc_day   = oda * torch.sin(2 * torch.pi * td * freq_day)
-        osc_night = ona * torch.sin(2 * torch.pi * td * freq_night)
-        oscillations = day_factor * osc_day + (1 - day_factor) * osc_night
+            day_factor = smooth_transition(td % 24, 12 - ramp_hours, 12) * \
+                         (1 - smooth_transition(td % 24, 20, 20 + ramp_hours))
+            baseline = nb + (db - nb) * day_factor
 
-        # base random noise
-        noise = torch.randn(len(td)) * noise_scale
+            drift_phase = 2 * torch.pi * torch.rand(1).item()
+            trend = 0.05 * baseline * torch.sin(2 * torch.pi * td / 24 + drift_phase)
 
-        # extra jitter around ramp hours
-        ramp_mask = ((td % 24 >= 8 - ramp_hours) & (td % 24 <= 8 + ramp_hours)) | \
-                    ((td % 24 >= 20 - ramp_hours) & (td % 24 <= 20 + ramp_hours))
-        transition_noise = ramp_mask.float() * torch.randn(len(td)) * ramp_jitter
+            freq_day = (f_day + torch.randn(1).item() * 0.5) / 24
+            freq_night = (f_night + torch.randn(1).item() * 0.5) / 24
+            osc_day   = oda * torch.sin(2 * torch.pi * td * freq_day)
+            osc_night = ona * torch.sin(2 * torch.pi * td * freq_night)
+            oscillations = day_factor * osc_day + (1 - day_factor) * osc_night
 
-        # random walk for slow drift
-        random_walk = torch.cumsum(torch.randn(len(td)) * 0.05, 0)
+            noise = torch.randn(len(td)) * noise_scale       
 
-        load[day_offset] = baseline + trend + oscillations + noise + transition_noise + random_walk
-    load = torch.clamp(load, min=0)
-    # # # Lines 164 - 167 (and the modified load set of return statement) were added by me
-    actual_load_mean = torch.mean(load)
-    noise_scale_forecast = actual_load_mean * 0.15
-    forecast_error = torch.randn(len(load)) * noise_scale_forecast
-    modified_load_set = load + forecast_error
-    return t, load, modified_load_set
 
+            ramp_mask = ((td % 24 >= 8 - ramp_hours) & (td % 24 <= 8 + ramp_hours)) | \
+                        ((td % 24 >= 20 - ramp_hours) & (td % 24 <= 20 + ramp_hours))
+            transition_noise = ramp_mask.float() * torch.randn(len(td)) * ramp_jitter
+
+            random_walk = torch.cumsum(torch.randn(len(td)) * 0.05, 0)
+
+            load[day_offset] = baseline + trend + oscillations + noise + transition_noise + random_walk
+
+        load = torch.clamp(load, min=0)
+        
+        if training:
+            start = torch.randint(0, n_samples-nsteps, size=(1,)).item()
+            ### Independently sample n loads from the created distribution (n=number of steps) 
+            realized = load[start : start + nsteps]         ### Randomize start index for slicing; allows every phase of diurnal cycle (daytime, nightime, and ramp loads) to be represented in the data
+
+            realized_load_list.append(realized)
+        else:    ### During training, number_of_days will be set higher, so we can just take a continuous sweep of data across each day
+            realized_load_list.append(load)
+            
+    realized_load = torch.stack(realized_load_list, dim=0).unsqueeze(-1)   ### Convert list of load tensors to tensor
+    return t, realized_load
+
+noise_generator = torch.Generator(device='cpu').manual_seed(1089) ## Seed instantiated only once during definition. 
+### This ensures a fixed sequence (reproduceability) although each forward pass would have a different draw (realized loads)
+
+def generate_forecast(x, training=True): 
+        """
+        Takes a batch of realized (true) loads and returns a batch of imperfect forecasts
+        by adding zero-mean Gaussian noise.
+
+        For each training batch, a different forecast error is generated for every sample 
+        (different CV-RMSE and independent noise realization). This creates a distribution of 
+        forecast scenarios during training. Since the loss is averaged over the batch, 
+        the policy learns to perform well on average, regardless of whether the forecast 
+        over- or under-estimated the true load (within reasonable bounds).
+        """
+        
+        
+        if training:
+            batch_size = x.shape[0] ### Use batch_size so that each forward pass in 1 batch exposes policies to a different average magnitude of forecast error (and the loss is averaged over all of them at the end of the batch).
+            cv = (0.15) * torch.rand(batch_size, 1, 1, generator=noise_generator, device='cpu')
+        else:   
+            cv = (0.15) * torch.rand(1, 1, 1, generator=noise_generator, device='cpu')
+        
+        load_mean = torch.mean(x)
+        noise_scale_forecast = load_mean * cv
+        ### This error is our uncertainty (as mentioned in proposal). It is a normal distribution. The adopted seeding approach ensures we get a different 'load_forecast' each forward pass
+        forecast_error = torch.randn(x.shape, generator= noise_generator) * noise_scale_forecast  ### Can be positive or negative, capturing scenarios where forecast overshoots or undershoots the realized load 
+        load_forecast = x + forecast_error
+        
+        min_load=5.0  ### Value inspired by observed min over several runs of original code
+        mask = load_forecast <= min_load
+        while mask.any(): ### Fix issue identified during test run, preventing the generation of unreasonable load values (e.g. 0., 2.)
+            new_error = torch.randn(x.shape, generator=noise_generator) * noise_scale_forecast
+            load_forecast[mask] = x[mask] + new_error[mask]   
+            
+            mask = load_forecast <= min_load
+            
+        return load_forecast.clamp(min=0.)
+    
 def plot_chiller_data(data, save_path=None, Ts=init.Ts, time_unit=None):
     ls = ['-','--']
     clrs=['tab:blue', 'tab:red']
@@ -264,13 +308,13 @@ def plot_chiller_data(data, save_path=None, Ts=init.Ts, time_unit=None):
     ### This counts all time steps when total cooling delivered is less than the load at that time step
     n_violations = 0; tolerance = 5 # [kW]
     for i in range(s_length):
-        if not data['Q_delivered'][0,i,:].sum(dim=-1, keepdim=True) + tolerance >= data['realized_load'][0,i,0]:
+        if not data['Q_delivered'][0,i,:].sum(dim=-1, keepdim=True) + tolerance >= data['load'][0,i,0]:
             n_violations += 1
     cost = torch.sum(data['P_pump'].sum(dim=-1,keepdim=True) + data['P_chiller'].sum(dim=-1, keepdim=True) + \
                      0. *  data['chiller_status'].sum(-1,keepdim=True)) *(Ts/3600)
     
     ### This checks the RMSE between the delivered cooling and the load
-    control_RMSE = torch.sqrt(torch.mean((data['realized_load'][:,:s_length,:] - data['Q_delivered'].sum(dim=-1, keepdim=True))**2))
+    control_RMSE = torch.sqrt(torch.mean((data['load'][:,:s_length,:] - data['Q_delivered'].sum(dim=-1, keepdim=True))**2))
 
 
     axes[1].set_title(f'Total cost of operation:  {cost.item():.1f} [kWh] \n  \
@@ -614,14 +658,33 @@ def plot_chiller_data_paper(*datas, labels=None, save_path=None, Ts=180, time_un
 # SIGNAL PLOT
 if __name__ == '__main__':
     import matplotlib.pyplot as plt
-    t, load = generate_datacenter_load(sampling_time=300, number_of_days=7, ramp_hours=init.ramp_hours,
-                                       f_day=5, f_night=6, 
-                                       day_baseline=init.day_baseline, 
-                                       night_baseline=init.night_baseline,
-                                       osc_night_amp=20, osc_day_amp=20,
-                                       noise_scale=5)
-    
+    # t, load = generate_load(sampling_time=300, number_of_days=7, ramp_hours=init.ramp_hours,
+    #                                    f_day=5, f_night=6, 
+    #                                    day_baseline=init.day_baseline, 
+    #                                    night_baseline=init.night_baseline,
+    #                                    osc_night_amp=20, osc_day_amp=20,
+    #                                    noise_scale=5)
+    t, load = generate_realized_load(
+            sampling_time=300,
+            nsteps=15,
+            num_scenarios=1,
+            number_of_days=7,
+            ramp_hours=init.ramp_hours,
+            night_baseline=init.night_baseline,
+            osc_night_amp=20,
+            day_baseline=init.day_baseline,
+            osc_day_amp=20,
+            noise_scale=5,
+            ramp_jitter=5,
+            f_day=5,
+            f_night=6,
+            daily_variation=0.1,
+            signal_start_seed=303,
+            training=True,
+        )
     plt.figure(figsize=(10,4)); plt.plot(t, load.numpy(), lw=1)
     plt.xlabel("Time [hours]"); plt.ylabel("Load [kW]")
     plt.grid(True, alpha=0.3); plt.show()
 
+
+# %%

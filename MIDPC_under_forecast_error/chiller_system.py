@@ -48,7 +48,10 @@ class ChillerSystem(torch.nn.Module):
             self.h_filter = self.h_filter.to(device)
 
         # ---- SAFE IN-PLACE UPDATE ----
-        self.load_buffer[:, 1:] = self.load_buffer[:, :-1].clone()
+        
+        ### This moves the load history forward in time so that the model retains memory of previous loads
+        ### This mandates the creation of a separate instance of the chiller system for the realized load filter to avoid using memory of the "wrong type of load" 
+        self.load_buffer[:, 1:] = self.load_buffer[:, :-1].clone() 
         self.load_buffer[:, 0] = load_flat
 
         # Compute filtered output

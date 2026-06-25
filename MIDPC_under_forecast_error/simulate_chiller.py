@@ -3,52 +3,51 @@ from argparse import ArgumentParser
 from pyexpat import model
 import torch; from init import SystemParameters
 from chiller_system import ChillerSystem
-from utils import generate_datacenter_load, plot_chiller_data
+from utils import generate_realized_load, generate_forecast, plot_chiller_data
 from utils import customMPL;
 import time
 torch.set_default_device('cpu')
 def simulate(
-        T_supply_0, T_return_0, load_signal, modified_load_set,
+        T_supply_0, T_return_0, load_forecast, realized_load,
         dynamics_forward, policy, nsteps=10, #time_limit=3600
-        verbose=False, system=None, n_days=1, Ts=180, s_length=None, time_limit=3600,
+        verbose=False, system=None, system_realizedL=None, n_days=1, Ts=180, s_length=None, time_limit=3600,
         pass_filtered_load_to_policy=True):
     # # # History Lists
     T_supply_hist, T_return_hist, T_evap_hist, mass_flow_hist, chiller_status_hist, \
     relaxed_integer_hist, inference_time_hist = \
     [], [], [], [], [], [], []      
     
-    # # # Create separate list of loads for dynamics 
     T_supply, T_return = T_supply_0, T_return_0 # Initial conditions
     T_supply_hist.append(T_supply_0); T_return_hist.append(T_return_0) # Save initial condition
     s_length = int((n_days*24*60*60)/(Ts)) if s_length is None else s_length # Simulation length
     
     # Precomputing filtered load forecast
-    filtered_load = None
+    filtered_load_forecast = None
     if pass_filtered_load_to_policy:
         filtered = []
-        for k in range(load_signal.size(1)):
-            filtered.append(system.apply_load_filter(load_signal[0, k]))
-        filtered_load = torch.vstack(filtered).view(1,-1,1)
+        for k in range(load_forecast.size(1)):
+            filtered.append(system.apply_load_filter(load_forecast[0, k]))
+        filtered_load_forecast = torch.vstack(filtered).view(1,-1,1)
         
-    ### My addition: Precompute the modified load similarly
         
     start_time = time.time()
     for k in range(s_length): # Simulation Loop
         print("Timestep: ", k) if verbose else None
         if pass_filtered_load_to_policy:
-            decisions = policy(T_supply=T_supply, T_return=T_return, load=load_signal[:,k:k+nsteps,:], filtered_load=filtered_load[:,k:k+nsteps,:])
+            decisions = policy(T_supply=T_supply, T_return=T_return, load=load_forecast[:,k:k+nsteps,:], filtered_load=filtered_load_forecast[:,k:k+nsteps,:])
         else:
-            decisions = policy(T_supply=T_supply, T_return=T_return, load=load_signal[:,k:k+nsteps,:])
+            decisions = policy(T_supply=T_supply, T_return=T_return, load=load_forecast[:,k:k+nsteps,:])
         # # # Read data
         relaxed_integer, inference_time = decisions.get('relaxed_integer'), decisions.get('inference_time')
         integer, mass_flow, T_evap = decisions['integer'], decisions['flow'], decisions['T_evap']
         # # # Dynamics
         x = dynamics_forward(torch.cat((T_supply,T_return), dim=-1),
-                            integer, mass_flow, T_evap, system.apply_load_filter(modified_load_set[:,[k],:])) # Forward dynamics
+                            integer, mass_flow, T_evap, system_realizedL.apply_load_filter(realized_load[:,[k],:])) # Forward dynamics
         # # # Decouple
         T_supply = x[:,:,:-1]
         T_return = x[:,:,[-1]] # Last state is T_return
         # # # Histroy
+        
         T_supply_hist.append(T_supply); T_return_hist.append(T_return); # Save states
         chiller_status_hist.append(integer); mass_flow_hist.append(mass_flow); T_evap_hist.append(T_evap) # Save decision
         relaxed_integer_hist.append(relaxed_integer) if relaxed_integer is not None else None # Optional argument
@@ -84,8 +83,7 @@ def simulate(
         integer_status=output['chiller_status'], mass_flow=output['mass_flow'],
         T_supply=output['T_supply'][:,:-1,:]
     )
-    output['load'] = load_signal[:,:s_length,:]
-    output['realized_load'] = modified_load_set[:,:s_length,:] ### Add realized load to output
+    output['load'] = load_forecast[:,:s_length,:]
     return output
 
 if __name__=='__main__':
@@ -111,6 +109,7 @@ if __name__=='__main__':
     # init = SystemParameters(Ts=args.Ts, M=args.M)
     init = SystemParameters(M=args.M)
     chiller_system = ChillerSystem(init=init)
+    chiller_system_realizedL = ChillerSystem(init=init) # Only use this for filtering realized load 
     s_length = args.s_length
     # # # Initialize the policy
     if args.policy == 'RBC':
@@ -127,9 +126,9 @@ if __name__=='__main__':
             )
    
     elif args.policy == 'MIDPC':
-        from MIDPC import MIDPC_policy, round_fn, load_filter
+        from MIDPC import MIDPC_policy, round_fn, load_filter, realized_load_filter
         policy = MIDPC_policy(
-            load_path=rf'C:\\Users\\dzoss\\Desktop\\MI-DPC\\results\\MIDPCPolicy3_N_15_Ts_180_M_3.pt',
+            load_path=rf"C:\Users\dzoss\Desktop\MI-DPC\results\MIDPCPolicy_0624_N_15_Ts_180_M_2_new.pt",
             nsteps=args.nsteps,
             measure_inference_time=True,
             )
@@ -138,9 +137,9 @@ if __name__=='__main__':
         ### now you can evaluate it
         # policy.eval()
     elif args.policy == 'MIDPC_OL': # Deprecated
-        from MIDPC_OL import MIDPC_OL_policy, round_fn, load_filter
+        from MIDPC_OL import MIDPC_OL_policy, round_fn, load_filter, realized_load_filter
         policy = MIDPC_OL_policy(
-            load_path=rf'C:\\Users\\dzoss\\Desktop\\MI-DPC\\results\\MIDPCPolicy3_N_15_Ts_180_M_3.pt',
+            load_path=rf"C:\Users\dzoss\Desktop\MI-DPC\results\MIDPCPolicy_0624_N_15_Ts_180_M_2_new.pt",
             nsteps=args.nsteps,
             measure_inference_time=True,
             )
@@ -166,19 +165,36 @@ if __name__=='__main__':
     integrator = integrators.RK4(chiller_system, h=torch.tensor(init.Ts))
     
     # # # Load test
-    seed = init.seed
-    load_time, load_test, load_with_uncertainty = generate_datacenter_load(number_of_days=args.n_days+1,
-                                                    sampling_time=init.Ts, 
-                                                    signal_seed=seed,
+    seed = init.seed + 5
+
+    _, realized_loads_test = generate_realized_load(
+                                                    sampling_time=args.Ts,
+                                                    nsteps=args.nsteps,
+                                                    num_scenarios=1,
+                                                    number_of_days=args.n_days+1,
                                                     ramp_hours=init.ramp_hours,
-                                                    f_day=5, f_night=6, 
-                                                    day_baseline=init.day_baseline, 
+                                                    f_day=5, f_night=6,
+                                                    day_baseline=init.day_baseline,
                                                     night_baseline=init.night_baseline,
                                                     osc_night_amp=20, osc_day_amp=20,
                                                     noise_scale=5,
+                                                    signal_start_seed=seed,
+                                                    training=False
                                                     )
-    load_test = load_test.reshape(1,-1,1)
-    load_with_uncertainty = load_with_uncertainty.reshape(1,-1,1)
+    
+
+    realized_loads_test = realized_loads_test.reshape(1,-1,1)
+    load_forecast = generate_forecast(realized_loads_test, training=False)
+    
+    print("Load Forecast min:", realized_loads_test.min().item())
+    print("Load Forecast max:", realized_loads_test.max().item())
+    print(realized_loads_test)
+    
+    print("Realized load min:", load_forecast.min().item())
+    print("Realized Load max:", load_forecast.max().item())
+    print(load_forecast)
+    
+    
     # # # Initial conditions
     T_supply_0 = torch.ones(1,1,init.M) * 7.
     T_return_0 = torch.ones(1,1,1) * 7.
@@ -186,19 +202,20 @@ if __name__=='__main__':
     outputs = simulate(
                         T_supply_0=T_supply_0, # IC
                         T_return_0=T_return_0, # IC
-                        load_signal=load_test, # Disturbance,
-                        modified_load_set= load_with_uncertainty, # For analysis only
+                        load_forecast=load_forecast, 
+                        realized_load= realized_loads_test,
                         dynamics_forward=integrator, # Dynamics model [integrator or chiller_system.forward]
                         policy=policy, # Control strategy
                         nsteps=args.nsteps, # Prediction horizon for [MIDPC, MIMPC]
                         verbose=False, # Print current timestep
                         system=chiller_system, # For computing score variables
+                        system_realizedL=chiller_system_realizedL,
                         n_days=args.n_days,
                         s_length=s_length,
                         pass_filtered_load_to_policy=(args.policy != 'MIDPC_OL'), # Deprecated
                        ) # Returns dictionary
     # # # Save outputs for analysis
-    torch.save(outputs, rf'C:\\Users\\dzoss\\Desktop\\MI-DPC\\results\\{args.policy}3_Prove_Failure_N{args.nsteps}_Ts_{init.Ts}_M_{init.M}_15perc.pt')
+    torch.save(outputs, rf'C:\\Users\\dzoss\\Desktop\\MI-DPC\\results\\{args.policy}_out624_N{args.nsteps}_Ts_{init.Ts}_M_{init.M}_new2.pt')
     
     if args.plotting:
-        plot_chiller_data(outputs, Ts=init.Ts, time_unit='h',save_path=f'C:\\Users\\dzoss\\Desktop\\MI-DPC\\results\\plots\\{args.policy}3_Prove_Failure_N{args.nsteps}_Ts_{init.Ts}_M_{init.M}_15perc.pdf')
+        plot_chiller_data(outputs, Ts=init.Ts, time_unit='h',save_path=f'C:\\Users\\dzoss\\Desktop\\MI-DPC\\results\\plots\\{args.policy}_0624_N{args.nsteps}_Ts_{init.Ts}_M_{init.M}_new2.pdf')
