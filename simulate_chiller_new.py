@@ -1,0 +1,221 @@
+#%%
+from argparse import ArgumentParser
+from pyexpat import model
+import torch; from init import SystemParameters
+from chiller_system import ChillerSystem
+from utils_new import generate_realized_load, generate_forecast, plot_chiller_data
+from utils_new import customMPL;
+import time
+torch.set_default_device('cpu')
+def simulate(
+        T_supply_0, T_return_0, load_forecast, realized_load,
+        dynamics_forward, policy, nsteps=10, #time_limit=3600
+        verbose=False, system=None, system_realizedL=None, n_days=1, Ts=180, s_length=None, time_limit=3600,
+        pass_filtered_load_to_policy=True):
+    # # # History Lists
+    T_supply_hist, T_return_hist, T_evap_hist, mass_flow_hist, chiller_status_hist, \
+    relaxed_integer_hist, inference_time_hist = \
+    [], [], [], [], [], [], []      
+    
+    T_supply, T_return = T_supply_0, T_return_0 # Initial conditions
+    T_supply_hist.append(T_supply_0); T_return_hist.append(T_return_0) # Save initial condition
+    s_length = int((n_days*24*60*60)/(Ts)) if s_length is None else s_length # Simulation length
+    
+    # Precomputing filtered load forecast
+    filtered_load_forecast = None
+    if pass_filtered_load_to_policy:
+        filtered = []
+        for k in range(load_forecast.size(1)):
+            filtered.append(system.apply_load_filter(load_forecast[0, k]))
+        filtered_load_forecast = torch.vstack(filtered).view(1,-1,1)
+        
+        
+    start_time = time.time()
+    for k in range(s_length): # Simulation Loop
+        print("Timestep: ", k) if verbose else None
+        if pass_filtered_load_to_policy:
+            decisions = policy(T_supply=T_supply, T_return=T_return, load=load_forecast[:,k:k+nsteps,:], filtered_load=filtered_load_forecast[:,k:k+nsteps,:])
+        else:
+            decisions = policy(T_supply=T_supply, T_return=T_return, load=load_forecast[:,k:k+nsteps,:])
+        # # # Read data
+        relaxed_integer, inference_time = decisions.get('relaxed_integer'), decisions.get('inference_time')
+        integer, mass_flow, T_evap = decisions['integer'], decisions['flow'], decisions['T_evap']
+        # # # Dynamics
+        x = dynamics_forward(torch.cat((T_supply,T_return), dim=-1),
+                            integer, mass_flow, T_evap, system_realizedL.apply_load_filter(realized_load[:,[k],:])) # Forward dynamics
+        # # # Decouple
+        T_supply = x[:,:,:-1]
+        T_return = x[:,:,[-1]] # Last state is T_return
+        # # # Histroy
+        
+        T_supply_hist.append(T_supply); T_return_hist.append(T_return); # Save states
+        chiller_status_hist.append(integer); mass_flow_hist.append(mass_flow); T_evap_hist.append(T_evap) # Save decision
+        relaxed_integer_hist.append(relaxed_integer) if relaxed_integer is not None else None # Optional argument
+        inference_time_hist.append(inference_time) if inference_time is not None else None # Optional argument
+        if time.time() - start_time > time_limit: # Exceeding time limit
+            print("Time limit exceeded")
+            break
+
+    # # # Output Dictionary
+    output = {}
+    if relaxed_integer_hist: # Relaxed integer for MIDPC
+        output['relaxed_integer'] = torch.vstack(relaxed_integer_hist).swapaxes(0, 1)
+    if inference_time_hist: # Inference time for [MIDPC, MIMPC]
+        output['inference_time'] = torch.vstack(inference_time_hist).swapaxes(0, 1)
+    output['T_supply'] = torch.vstack(T_supply_hist).swapaxes(0,1)
+    output['T_return'] = torch.vstack(T_return_hist).swapaxes(0,1)
+    output['chiller_status'] = torch.vstack(chiller_status_hist).swapaxes(0,1)
+    output['mass_flow'] = torch.vstack(mass_flow_hist).swapaxes(0,1)
+    output['T_evap'] = torch.vstack(T_evap_hist).swapaxes(0,1)
+    # # # Compute scores
+    output['P_chiller'] = system.get_chiller_power_PLR(
+        integer_status=output['chiller_status'], mass_flow=output['mass_flow'],
+        T_return=output['T_return'][:,:-1,:], T_supply=output['T_supply'][:,:-1,:],
+    )
+    output['P_pump'] = system.get_pump_consumption(
+        integer_status=output['chiller_status'], mass_flow=output['mass_flow']
+        )
+    output['Q_delivered'] = system.get_cooling_delivered_per_chiller(
+        integer_status=output['chiller_status'], mass_flow=output['mass_flow'],
+        T_return=output['T_return'][:,:-1,:], T_supply=output['T_supply'][:,:-1,:],
+    )
+    output['T_out'] = system.get_outlet_temperature(
+        integer_status=output['chiller_status'], mass_flow=output['mass_flow'],
+        T_supply=output['T_supply'][:,:-1,:]
+    )
+    output['load'] = load_forecast[:,:s_length,:]
+    return output
+
+if __name__=='__main__':
+    parser = ArgumentParser()
+    parser.add_argument('-policy', choices=['MIDPC', 'MIMPC', 'RBC', 'MIDPC_OL'], default='MIMPC',
+        help='Choice of control strategy can be MI-DPC, implicit MI-MPC or Rule-based controller.')
+    parser.add_argument('-nsteps', default=2, type=int, help='Prediction horizon length.')
+    parser.add_argument('-Ts', default=180, type=int, help='Sampling time.')
+    parser.add_argument('-M', default=2, type=int, help='Number of chillers.')
+    parser.add_argument('-n_days', default=7, type=int, help='Number of days of simulation.')
+    parser.add_argument('-plotting', default=True, type=bool, help='Plot or not.')
+    parser.add_argument('-s_length', default=None, type=int, help='Overrides n_days if defined.')
+    
+    # args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
+    try:
+        from neuromancer.dynamics import integrators
+    except Exception as e:
+        raise RuntimeError(
+            "Cannot import neuromancer.integrators (often NumPy 2 vs pyarrow). "
+            "Try: pip install --upgrade pyarrow  OR  pip install 'numpy<2'"
+        ) from e
+    # init = SystemParameters(Ts=args.Ts, M=args.M)
+    init = SystemParameters(M=args.M)
+    chiller_system = ChillerSystem(init=init)
+    chiller_system_realizedL = ChillerSystem(init=init) # Only use this for filtering realized load 
+    s_length = args.s_length
+    # # # Initialize the policy
+    if args.policy == 'RBC':
+        from RBC import RBC_policy
+        policy = RBC_policy(
+            PLR_on=0.6,
+            PLR_off=0.15,
+            n_active_chillers=init.M,
+            M = init.M,
+            Q_delivered_max=init.Q_delivered_max,
+            T_evap_const=9.,
+            mass_flow_const=13.,
+        system = chiller_system
+            )
+   
+    elif args.policy == 'MIDPC':
+        from MIDPC_new import MIDPC_policy, round_fn, load_filter, realized_load_filter
+        policy = MIDPC_policy(
+            load_path=rf"C:\Users\dzoss\Desktop\MI-DPC\results\MIDPCPolicy_0624_N_15_Ts_180_M_2_new.pt",
+            nsteps=args.nsteps,
+            measure_inference_time=True,
+            )
+        # cl_system = torch.load('C:\\Users\\dzoss\\Desktop\\MI-DPC\\results\\MIDPCPolicy_N_15_Ts_180_M_2.pt', weights_only=False, map_location=torch.device('cpu'))
+        # policy.load_state_dict(cl_system['state_dict'])
+        ### now you can evaluate it
+        # policy.eval()
+    elif args.policy == 'MIDPC_OL': # Deprecated
+        from MIDPC_OL import MIDPC_OL_policy, round_fn, load_filter, realized_load_filter
+        policy = MIDPC_OL_policy(
+            load_path=rf"C:\Users\dzoss\Desktop\MI-DPC\results\MIDPCPolicy_0624_N_15_Ts_180_M_2_new.pt",
+            nsteps=args.nsteps,
+            measure_inference_time=True,
+            )
+        
+    elif args.policy == 'MIMPC':
+        from MIMPC import MIMPC_policy
+        # if args.s_length is None:
+        #     s_length = 20
+        policy = MIMPC_policy(
+            nsteps=args.nsteps,
+            M = args.M,
+            Ts = init.Ts,
+            measure_inference_time=True,
+            ocp_formulation=0,
+            exponent=init.exponent,
+            solver='gurobi',
+            verbose=True,
+            max_solver_time=180,
+            McCormick=True,
+            warmstart=False
+        )
+    
+    integrator = integrators.RK4(chiller_system, h=torch.tensor(init.Ts))
+    
+    # # # Load test
+    seed = init.seed + 5
+
+    _, realized_loads_test = generate_realized_load(
+                                                    sampling_time=args.Ts,
+                                                    nsteps=args.nsteps,
+                                                    num_scenarios=1,
+                                                    number_of_days=args.n_days+1,
+                                                    ramp_hours=init.ramp_hours,
+                                                    f_day=5, f_night=6,
+                                                    day_baseline=init.day_baseline,
+                                                    night_baseline=init.night_baseline,
+                                                    osc_night_amp=20, osc_day_amp=20,
+                                                    noise_scale=5,
+                                                    signal_start_seed=seed,
+                                                    training=False
+                                                    )
+    
+
+    realized_loads_test = realized_loads_test.reshape(1,-1,1)
+    load_forecast = generate_forecast(realized_loads_test, training=False)
+    
+    print("Load Forecast min:", realized_loads_test.min().item())
+    print("Load Forecast max:", realized_loads_test.max().item())
+    print(realized_loads_test)
+    
+    print("Realized load min:", load_forecast.min().item())
+    print("Realized Load max:", load_forecast.max().item())
+    print(load_forecast)
+    
+    
+    # # # Initial conditions
+    T_supply_0 = torch.ones(1,1,init.M) * 7.
+    T_return_0 = torch.ones(1,1,1) * 7.
+    print(f'Simulating chiller with {args.policy}, N={args.nsteps}, M={init.M}')
+    outputs = simulate(
+                        T_supply_0=T_supply_0, # IC
+                        T_return_0=T_return_0, # IC
+                        load_forecast=load_forecast, 
+                        realized_load= realized_loads_test,
+                        dynamics_forward=integrator, # Dynamics model [integrator or chiller_system.forward]
+                        policy=policy, # Control strategy
+                        nsteps=args.nsteps, # Prediction horizon for [MIDPC, MIMPC]
+                        verbose=False, # Print current timestep
+                        system=chiller_system, # For computing score variables
+                        system_realizedL=chiller_system_realizedL,
+                        n_days=args.n_days,
+                        s_length=s_length,
+                        pass_filtered_load_to_policy=(args.policy != 'MIDPC_OL'), # Deprecated
+                       ) # Returns dictionary
+    # # # Save outputs for analysis
+    torch.save(outputs, rf'C:\\Users\\dzoss\\Desktop\\MI-DPC\\results\\{args.policy}_out624_N{args.nsteps}_Ts_{init.Ts}_M_{init.M}_new2.pt')
+    
+    if args.plotting:
+        plot_chiller_data(outputs, Ts=init.Ts, time_unit='h',save_path=f'C:\\Users\\dzoss\\Desktop\\MI-DPC\\results\\plots\\{args.policy}_0624_N{args.nsteps}_Ts_{init.Ts}_M_{init.M}_new2.pdf')
