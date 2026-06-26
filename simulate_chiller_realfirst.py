@@ -3,7 +3,7 @@ from argparse import ArgumentParser
 from pyexpat import model
 import torch; from init import SystemParameters
 from chiller_system import ChillerSystem
-from utils import generate_realized_load, generate_load_forecast, plot_chiller_data
+from utils import generate_realized_load, generate_forecast, plot_chiller_data
 from utils import customMPL;
 import time
 torch.set_default_device('cpu')
@@ -128,7 +128,7 @@ if __name__=='__main__':
     elif args.policy == 'MIDPC':
         from MIDPC import MIDPC_policy, round_fn, load_filter, realized_load_filter
         policy = MIDPC_policy(
-            load_path=rf"C:\Users\dzoss\Desktop\MI-DPC\results\MIDPCPolicy_0625_N_15_Ts_180_M_2_v3.pt",
+            load_path=rf"C:\Users\dzoss\Desktop\MI-DPC\results\MIDPCPolicy_0624_N_15_Ts_180_M_2_new.pt",
             nsteps=args.nsteps,
             measure_inference_time=True,
             )
@@ -139,7 +139,7 @@ if __name__=='__main__':
     elif args.policy == 'MIDPC_OL': # Deprecated
         from MIDPC_OL import MIDPC_OL_policy, round_fn, load_filter, realized_load_filter
         policy = MIDPC_OL_policy(
-            load_path=rf"C:\Users\dzoss\Desktop\MI-DPC\results\MIDPCPolicy_0625_N_15_Ts_180_M_2_v3.pt",
+            load_path=rf"C:\Users\dzoss\Desktop\MI-DPC\results\MIDPCPolicy_0624_N_15_Ts_180_M_2_new.pt",
             nsteps=args.nsteps,
             measure_inference_time=True,
             )
@@ -167,29 +167,33 @@ if __name__=='__main__':
     # # # Load test
     seed = init.seed + 5
 
-    _, load_forecast_test = generate_load_forecast(number_of_days=args.n_days+1,
-                                                    sampling_time=init.Ts, 
-                                                    signal_seed=seed,
+    _, realized_loads_test = generate_realized_load(
+                                                    sampling_time=args.Ts,
+                                                    nsteps=args.nsteps,
+                                                    num_scenarios=1,
+                                                    number_of_days=args.n_days+1,
                                                     ramp_hours=init.ramp_hours,
-                                                    f_day=5, f_night=6, 
-                                                    day_baseline=init.day_baseline, 
+                                                    f_day=5, f_night=6,
+                                                    day_baseline=init.day_baseline,
                                                     night_baseline=init.night_baseline,
                                                     osc_night_amp=20, osc_day_amp=20,
                                                     noise_scale=5,
+                                                    signal_start_seed=seed,
+                                                    training=False
                                                     )
     
 
-    ## Deployment Call
-    realized_load = generate_realized_load(load_forecast_test, args.nsteps, training=False)
-    # print("Load Forecast min:", load_forecast_test.min().item())
-    # print("Load Forecast max:", load_forecast_test.max().item())
-    print(load_forecast_test.shape)
+    realized_loads_test = realized_loads_test.reshape(1,-1,1)
+    _, load_forecast = generate_forecast(realized_loads_test, training=False)
     
-    # print("Realized load min:", realized_load.min().item())
-    # print("Realized Load max:", realized_load.max().item())
-    print(realized_load.shape)
-    load_forecast_test = load_forecast_test.reshape(1,-1,1)
-    realized_load = realized_load.reshape(1,-1,1)
+    print("Load Forecast min:", realized_loads_test.min().item())
+    print("Load Forecast max:", realized_loads_test.max().item())
+    print(realized_loads_test)
+    
+    print("Realized load min:", load_forecast.min().item())
+    print("Realized Load max:", load_forecast.max().item())
+    print(load_forecast)
+    
     
     # # # Initial conditions
     T_supply_0 = torch.ones(1,1,init.M) * 7.
@@ -198,8 +202,8 @@ if __name__=='__main__':
     outputs = simulate(
                         T_supply_0=T_supply_0, # IC
                         T_return_0=T_return_0, # IC
-                        load_forecast=load_forecast_test, 
-                        realized_load= realized_load,
+                        load_forecast=load_forecast, 
+                        realized_load= realized_loads_test,
                         dynamics_forward=integrator, # Dynamics model [integrator or chiller_system.forward]
                         policy=policy, # Control strategy
                         nsteps=args.nsteps, # Prediction horizon for [MIDPC, MIMPC]
@@ -211,7 +215,7 @@ if __name__=='__main__':
                         pass_filtered_load_to_policy=(args.policy != 'MIDPC_OL'), # Deprecated
                        ) # Returns dictionary
     # # # Save outputs for analysis
-    torch.save(outputs, rf'C:\\Users\\dzoss\\Desktop\\MI-DPC\\results\\{args.policy}_out625_N{args.nsteps}_Ts_{init.Ts}_M_{init.M}.pt')
+    torch.save(outputs, rf'C:\\Users\\dzoss\M\Desktop\\MI-DPC\\results\\{args.policy}_out624_N{args.nsteps}_Ts_{init.Ts}_M_{init.M}_new2.pt')
     
     if args.plotting:
-        plot_chiller_data(outputs, Ts=init.Ts, time_unit='h',save_path=f'C:\\Users\\dzoss\\Desktop\\MI-DPC\\results\\plots\\{args.policy}_0625_N{args.nsteps}_Ts_{init.Ts}_M_{init.M}.pdf')
+        plot_chiller_data(outputs, Ts=init.Ts, time_unit='h',save_path=f'C:\\Users\\dzoss\\Desktop\\MI-DPC\\results\\plots\\{args.policy}_0624_N{args.nsteps}_Ts_{init.Ts}_M_{init.M}_new2.pdf')

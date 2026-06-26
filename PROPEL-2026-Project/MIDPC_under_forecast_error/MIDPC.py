@@ -22,12 +22,9 @@ class MIDPC_policy():
                 
                 # self.cl_system.eval()
                 self.load_filter_node = self.cl_system.nodes[0]
-                
-                ### Add filter node for realized load 
-                ### Update the node indices
                 self.realized_load_filter_node = self.cl_system.nodes[1]
                 
-                
+                ### Update the node
                 self.integer_relaxed_node = self.cl_system.nodes[2]
                 self.integer_node = self.cl_system.nodes[3]
                 self.T_evap_node = self.cl_system.nodes[4]
@@ -40,11 +37,12 @@ class MIDPC_policy():
                 torch.set_grad_enabled(False)
                 torch.set_num_threads(1)
                 
-        def __call__(self, T_supply=None, T_return=None, load=None, filtered_load=None):
+                ### Add realized load to __call__ method
+        def __call__(self, T_supply=None, T_return=None, load=None, filtered_load=None, realized_load=None):
                 input_dict = {
                         'T_supply_and_return': torch.cat((T_supply,T_return), dim=-1).reshape(1,-1),
-                        'load_forecast': load.reshape(1,-1),
-                        'filtered_load_forecast': filtered_load[:,[0],:].reshape(1,-1),
+                        'load': load.reshape(1,-1),
+                        'filtered_load': filtered_load[:,[0],:].reshape(1,-1),
                                 }
                 
                 with torch.inference_mode():
@@ -73,7 +71,7 @@ class MIDPC_policy():
                 output['relaxed_integer'] = relaxed_integer['relaxed_integer'].unsqueeze(0)
                 output['flow'] = mass_flow['flow'].unsqueeze(0)
                 output['T_evap'] = T_evap['T_evap'].unsqueeze(0)
-                output['filtered_load_forecast'] = input_dict['filtered_load_forecast'].unsqueeze(0)
+                output['filtered_load'] = input_dict['filtered_load'].unsqueeze(0)
                 return output
 
 def relaxed_binary(x, slope=1.0, threshold=0.5):
@@ -97,7 +95,7 @@ def realized_load_filter(x):
 if __name__=='__main__':
         torch.manual_seed(202)
         parser = ArgumentParser()
-        parser.add_argument('-nsteps', default=15, type=int)
+        parser.add_argument('-nsteps', default=100, type=int)
         parser.add_argument('-Ts', default=180, type=int)
         parser.add_argument('-M', default=3, type=int)
         args, unknown = parser.parse_known_args()
@@ -141,9 +139,8 @@ if __name__=='__main__':
                                         clipping=False, spectral_norm=spectral_norm)
 
         # NEUROMANCER NODES
-        
-        load_filter_node = Node(load_filter, input_keys=['load_forecast'], output_keys=['filtered_load_forecast'])
-        load_filter_node({'load_forecast': torch.zeros(1,1, device=device)})
+        load_filter_node = Node(load_filter, input_keys=['load'], output_keys=['filtered_load'])
+        load_filter_node({'load': torch.zeros(1,1, device=device)})
 
         
         ### Create realized load filter node
@@ -158,7 +155,7 @@ if __name__=='__main__':
         
 
         policy_integer_node = Node(net_integer,
-                        input_keys=['T_supply_and_return','load_forecast', 'filtered_load_forecast'],
+                        input_keys=['T_supply_and_return','load', 'filtered_load'],
                         output_keys=['relaxed_integer'],
                         name='policy_integer')
         
@@ -166,25 +163,26 @@ if __name__=='__main__':
         rounding_node = Node(round_fn, input_keys=['relaxed_integer'], output_keys=['integer'], name='soft_rounding')
 
         policy_flow_node = Node(net_flow,
-                        input_keys=['T_supply_and_return','load_forecast', 'filtered_load_forecast'],
+                        input_keys=['T_supply_and_return','load', 'filtered_load'],
                         output_keys=['flow'],
                         name='policy_flow')
 
         policy_evap_node = Node(net_evap,
-                        input_keys=['T_supply_and_return','load_forecast', 'filtered_load_forecast'],
+                        input_keys=['T_supply_and_return','load', 'filtered_load'],
                         output_keys=['T_evap'],
                         name='policy_evap')
 
         # Build the closed-loop control NEUROMANCER SYSTEM
+        ### Add realized load filter node as the second node in the system
         cl_system = SystemPreview([load_filter_node, realized_load_filter_node, policy_integer_node, rounding_node, policy_evap_node, policy_flow_node , dynamics_node],
                                         nsteps=nsteps, name='cl_system', pad_mode='circular', pad_constant = 300,
-                                        preview_keys_map={'load_forecast': ['policy_flow', 'policy_integer', 'policy_evap']},
-                                        preview_length={'load_forecast': nsteps-1})
+                                        preview_keys_map={'load': ['policy_flow', 'policy_integer', 'policy_evap']},
+                                        preview_length={'load': nsteps-1})
 
         # Testing that cl_system can function as expected given necessary inputs 
         test_output = cl_system({ 'T_supply_and_return': torch.rand(1,1,init.M+1),
-                                'realized_load': torch.rand(1,nsteps,1),
-                                'load_forecast': torch.rand(1,nsteps,1),})
+                                'load': torch.rand(1,nsteps,1),
+                                'realized_load': torch.rand(1,nsteps,1)})
         
         #%%
         """ Variables
@@ -198,10 +196,7 @@ if __name__=='__main__':
         flow_variable = variable('flow') # Decision
         T_evap_variable = variable('T_evap') # Decision
         load_variable = variable('load') # External
-        realized_load_variable = variable('realized_load')
-        
-        filtered_realized_load_variable = variable('filtered_realized_load')
-        filtered_load_variable = variable('filtered_load_forecast')
+        filtered_load_variable = variable('filtered_load')
         T_supply_and_return_variable = variable('T_supply_and_return')
         T_return_variable = variable('T_supply_and_return')[:,:nsteps,init.M:] # No terminal state
         T_supply_variable = variable('T_supply_and_return')[:,:nsteps,:init.M] # No terminal state
@@ -216,7 +211,6 @@ if __name__=='__main__':
                                                                         T_supply=T_supply_variable) # Decisions
         
         #%% CONTROL OBJECTIVES
-                        
         chiller_loss =  ((system.get_chiller_power_PLR(integer_status=integer_variable, 
                                                         mass_flow=flow_variable,
                                                         T_return=T_return_variable,
@@ -225,15 +219,14 @@ if __name__=='__main__':
         pump_loss =  ((system.get_pump_consumption(mass_flow=flow_variable, 
                                 integer_status=integer_variable) == 0.))
         
-        ### Now that we allow load forecast to be "impercfect", the cooling loss must be evaluated using the actual cooling load uncovered in the system
-        ### in other words, what we care about is failure to meet the realized cooling load
         cooling_constant = 0.001 if init.M == 2 else 0.0005
-        cooling_loss = cooling_constant*((torch.sum(cooling_delivered_variable,dim=-1,keepdim=True) == realized_load_variable)^2.)
+        cooling_loss = cooling_constant*((torch.sum(cooling_delivered_variable,dim=-1,keepdim=True) == load_variable)^2.)
         # c = (40./(init.M-1)) if nsteps in nsteps_list[0] else 10.
         # c = 80. if nsteps in nsteps_list[0] else 10.
         c = 80.
         switching_loss = c*((integer_variable[:, 1:, :] == integer_variable[:, :-1, :])^2)
         binary_regularization = 200.*((relaxed_integer_variable * (1-relaxed_integer_variable) == 0.)^2)
+
 
         chiller_loss.name = 'chiller_loss'; pump_loss.name = 'pump_loss'; switching_loss.name = 'switching_loss'
         cooling_loss.name = 'cooling_loss'
@@ -251,9 +244,7 @@ if __name__=='__main__':
         T_supply_lb = 10.*(T_supply_and_return_variable[:,:,:init.M] >= init.T_supply_min) 
         T_supply_ub = 10.*(T_supply_and_return_variable[:,:,:init.M] <= init.T_supply_max)
         
-        ### Now that we allow load forecast to be "impercfect", the cooling bound must be evaluated using the actual cooling load uncovered in the system
-        ### 
-        cooling_bound = 0.5 * (torch.sum(cooling_delivered_variable[:,:nsteps,:],dim=-1,keepdim=True) + init.tolerance >= realized_load_variable[:,:nsteps,:]) # Cooling constr
+        cooling_bound = 0.5 * (torch.sum(cooling_delivered_variable[:,:nsteps,:],dim=-1,keepdim=True) + init.tolerance >= load_variable[:,:nsteps,:]) # Cooling constr
         cooling_bound.name='cooling_bound'
 
         input_constraints_const = 100. if init.M == 2 else 20.
@@ -286,47 +277,40 @@ if __name__=='__main__':
         # T_return_t = torch.rand(num_data, 1, 1).uniform_(init.T_return_min, init.T_return_max)
         T_return_t = torch.amax(T_supply_t, dim=-1, keepdim=True)
 
-        _, realized_loads_t = utils.generate_realized_load(
-                                                        sampling_time=Ts,
-                                                        nsteps=nsteps,
-                                                        num_scenarios=num_data,
-                                                        number_of_days=1,
+        _, loads_t_1d = utils.generate_load_forecast(
+                                                        number_of_days=14000, 
+                                                        sampling_time=Ts, 
                                                         ramp_hours=init.ramp_hours,
-                                                        f_day=5, f_night=6,
-                                                        day_baseline=init.day_baseline,
+                                                        f_day=5, f_night=6, 
+                                                        day_baseline=init.day_baseline, 
                                                         night_baseline=init.night_baseline,
                                                         osc_night_amp=20, osc_day_amp=20,
-                                                        noise_scale=5,
-                                                        signal_start_seed=init.seed,
-                                                        training=True
+                                                        noise_scale=5
                                                         )
-        print("Realized load min:", realized_loads_t.min().item())
-        print("Realized load max:", realized_loads_t.max().item())
-        print(realized_loads_t)
         
-        load_forecast_t = utils.generate_forecast(realized_loads_t, training=True)
-        print("Load forecast min:", load_forecast_t.min().item())
-        print("Load forecast max:", load_forecast_t.max().item())
-        print(load_forecast_t)
-        
+
+                ## Training test
+        load_t = loads_t_1d[:num_data*(nsteps)].reshape(num_data,nsteps,1)
+        print(load_t.shape)
+        realized_load = utils.generate_realized_load(load_t, nsteps, training=True)
+        print(realized_load.shape)
         
         train_data = DictDataset({'T_supply_and_return':torch.cat((T_supply_t[:num_train_data].to(device),
                                                                 T_return_t[:num_train_data].to(device)),dim=-1),
-                                'realized_load': realized_loads_t[:num_train_data].to(device), 
-                                'load_forecast': load_forecast_t[:num_train_data].to(device)}, name='train')  # Split conditions into train and dev
+                                'load': load_t[:num_train_data].to(device),
+                                'realized_load': realized_load[:num_train_data].to(device)}, name='train')  # Split conditions into train and dev
         
         dev_data = DictDataset({'T_supply_and_return': torch.cat((T_supply_t[num_train_data:].to(device),
                                                                 T_return_t[num_train_data:].to(device)),dim=-1),
-                                'realized_load': realized_loads_t[num_train_data:].to(device),
-                                'load_forecast': load_forecast_t[num_train_data:].to(device)}, name='dev')
-        
+                                'load': load_t[num_train_data:].to(device),
+                                'realized_load': realized_load[num_train_data:].to(device)}, name='dev')
         # instantiate data loaders
         train_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, collate_fn=train_data.collate_fn)
         dev_loader = torch.utils.data.DataLoader(dev_data, batch_size=batch_size, collate_fn=dev_data.collate_fn)
         logger = BasicLogger(stdout=['train_loss','dev_loss'],verbosity=10)
         #%% Optimizer
         print(f'Training MIDPC policy for N={nsteps}, M={init.M} at Ts={Ts}') 
-        learning_rate = 0.002
+        learning_rate = 0.006
         optimizer = torch.optim.Adam(cl_system.parameters(), lr=learning_rate, 
         weight_decay=0.006)
         trainer = Trainer(
@@ -339,15 +323,12 @@ if __name__=='__main__':
                 warmup=20,
                 patience=100,
                 clip=100., 
-                lr_scheduler=False,
+                lr_scheduler=True,
                 device=device,
                 epoch_verbose=10,
                 logger=logger,
         )
         start_time = time.time()
-        
-        ## 
-       
         best_model = trainer.train()    # start optimization
         trainer.model.load_state_dict(best_model) # load best 
         training_time = time.time() - start_time
@@ -357,6 +338,6 @@ if __name__=='__main__':
         n_parameters = count_parameters(cl_system)
         
         training_data = {'eltime': training_time, 'n_epochs': trainer.current_epoch, 'n_parameters': n_parameters}
-        torch.save(cl_system, rf'C:\\Users\\dzoss\Desktop\\MI-DPC\\results\\MIDPCPolicy_0624_N_{nsteps}_Ts_{Ts}_M_{init.M}_new.pt')
-        torch.save(training_data, rf'C:\\Users\\dzoss\\Desktop\\MI-DPC\\results\\Trainingdata_0624_N_{nsteps}_Ts_{Ts}_M_{init.M}_new.pt')
+        torch.save(cl_system, rf'C:\\Users\\dzoss\Desktop\\MI-DPC\\results\\MIDPCPolicy_0625_N_{nsteps}_Ts_{Ts}_M_{init.M}_v3.pt')
+        torch.save(training_data, rf'C:\\Users\\dzoss\\Desktop\\MI-DPC\\results\\Trainingdata_0625_N_{nsteps}_Ts_{Ts}_M_{init.M}_v3.pt')
 # %%
