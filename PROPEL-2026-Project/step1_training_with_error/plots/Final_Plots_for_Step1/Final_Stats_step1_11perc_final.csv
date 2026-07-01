@@ -1,0 +1,9 @@
+﻿Training Version,Error distribution,Cost of Operation,Control RMSE,Number of Violations
+"Trained with N(0, (0.11)^2)","N(0, (0.01*load mean)^2)",12283.8 ± 7.4,29.05 ± 0.05,1112 ± 18
+"Trained with N(0, (0.11)^2)","N(0, (0.03*load mean)^2)",12285.3 ± 22.0,29.94 ± 0.18,1165 ± 37
+"Trained with N(0, (0.11)^2)","N(0, (0.05*load mean)^2)",12290.4 ± 36.4,31.64 ± 0.34,1220 ± 29
+"Trained with N(0, (0.11)^2)","N(0, (0.07*load mean)^2)",12299.1 ± 50.4,34.03 ± 0.53,1261 ± 25
+"Trained with N(0, (0.11)^2)","N(0, (0.09*load mean)^2)",12311.8 ± 64.5,36.99 ± 0.74,1292 ± 32
+"Trained with N(0, (0.11)^2)","N(0, (0.11*load mean)^2)",12328.7 ± 78.5,40.38 ± 0.95,1324 ± 31
+"Trained with N(0, (0.11)^2)","N(0, (0.13*load mean)^2)",12349.6 ± 92.5,44.07 ± 1.23,1357 ± 30
+"Trained with N(0, (0.11)^2)","N(0, (0.15*load mean)^2)",12375.5 ± 106.1,48.05 ± 1.45,1379 ± 33
